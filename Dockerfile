@@ -14,11 +14,12 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Copy requirements and install
-COPY pyproject.toml ./
-RUN uv pip install --system -e .
+COPY requirements.txt pyproject.toml ./
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY src/ /app/src/
+COPY .env.example /app/.env.example
 
 # Expose port
 EXPOSE 8000
