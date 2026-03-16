@@ -33,6 +33,30 @@ def init_db():
                     db.add(RoomStock(room_type="suite", date=day, available=True))
             db.commit()
 
+
+def check_availability(
+    check_in: datetime.date,
+    check_out: datetime.date,
+    room_type: str = "standard"
+) -> bool:
+    """
+    Returns True if at least one room of the given type is available
+    for every night between check_in (inclusive) and check_out (exclusive).
+    """
+    with SessionLocal() as db:
+        current = check_in
+        while current < check_out:
+            count = db.query(RoomStock).filter(
+                RoomStock.room_type == room_type,
+                RoomStock.date == current,
+                RoomStock.available == True,
+            ).count()
+            if count == 0:
+                return False
+            current += datetime.timedelta(days=1)
+    return True
+
+
 # Call this on app startup
 if __name__ == "__main__":
     init_db()
