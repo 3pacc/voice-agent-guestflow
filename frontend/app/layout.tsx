@@ -27,7 +27,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <div className="app-shell">
           <aside className="sidebar">
             <div className="brand-wrap">
-              <img src="/assets/icons/guestflow-mark.svg" alt="GuestFlow" className="brand-logo" />
+              <img src="/assets/images/guestflow-logo.svg" alt="GuestFlow" className="brand-logo" />
               <div>
                 <div className="brand">GuestFlow Admin</div>
                 <div className="small">Multi-tenant live suite</div>
