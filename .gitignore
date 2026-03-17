@@ -3,3 +3,13 @@
 __pycache__/
 *.pyc
 .DS_Store
+node_modules/
+frontend/node_modules/
+.next/
+frontend/.next/
+*.log
+uvicorn.log
+vllm.log
+ngrok.log
+hotel_stock.db
+*.tgz

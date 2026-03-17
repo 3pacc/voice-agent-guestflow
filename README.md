@@ -106,3 +106,21 @@ pytest tests/
 ## 📄 Licence
 
 Ce projet a été généré dans le cadre d'un PoC d'Agent Vocal IA Cloud.
+
+## Full-stack Packaging (Frontend / Backend)
+
+Le projet est maintenant structure avec des packages separes:
+
+- `backend/` : manifests Python backend (`requirements.txt`, `pyproject.toml`)
+- `frontend/` : portail admin Next.js
+
+Demarrage rapide sur SSH:
+
+```bash
+# Backend
+pip install -r backend/requirements.txt
+./scripts/start_backend.sh
+
+# Frontend (nouveau terminal)
+./scripts/start_frontend.sh
+```

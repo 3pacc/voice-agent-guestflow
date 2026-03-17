@@ -1,84 +1,142 @@
 import asyncio
+import base64
 import logging
-import json
-import websockets
+import httpx
 from typing import AsyncGenerator
+
 from src.config.settings import settings
 
 logger = logging.getLogger(__name__)
 
+
 class InworldTTS:
     """
-    Client for Inworld TTS high-fidelity streaming.
-    Uses wss://api.inworld.ai/v1/tts endpoint for sub-second latency.
+    Inworld TTS client.
+    Uses REST API (POST /tts/v1/voice) and returns mulaw audio.
     """
+
     def __init__(self):
         self.api_key = settings.inworld_key
         self.api_secret = settings.inworld_secret
-        self.ws_url = "wss://api.inworld.ai/v1/tts" 
         self.model = "inworld-tts-1.5-max"
-        self.voice = "Clive"
+        self.voice = settings.inworld_voice_id or "default-ojjf5gdfr1kpiardizji5a__design-voice-c40d242e"
+        self.base_url = "https://api.inworld.ai"
+        self.temperature = settings.inworld_tts_temperature
+        self.speaking_rate = settings.inworld_tts_speaking_rate
 
-    async def stream_tts(self, text_stream: AsyncGenerator[str, None], sample_rate: int = 8000) -> AsyncGenerator[bytes, None]:
-        """
-        Takes an async generator of text chunks (from LLM) and yields an async generator of mulaw audio bytes.
-        Sends tokens progressively to the WebSocket to reduce time-to-first-byte (TTFB).
-        """
-        if not self.api_key or not self.api_secret:
-            logger.warning("INWORLD_KEY or INWORLD_SECRET is not set.")
+    def _auth_header(self) -> str:
+        if self.api_secret:
+            raw = f"{self.api_key}:{self.api_secret}"
+            encoded = base64.b64encode(raw.encode()).decode()
+            return f"Basic {encoded}"
+        return f"Basic {self.api_key}"
+
+    def _voice_candidates(self) -> list[str]:
+        """Return ordered voice fallback list for FR quality and robustness."""
+        preferred = (self.voice or "").strip()
+        candidates = []
+        if preferred:
+            candidates.append(preferred)
+            if preferred.lower() == "etienne":
+                candidates.append("?tienne")
+            if preferred.lower() == "h?l?ne":
+                candidates.append("Helene")
+            if preferred.lower() == "helene":
+                candidates.append("H?l?ne")
+
+        # French voice fallbacks available on this account
+        for v in ["Mathieu", "Alain", "H?l?ne", "?tienne", "Clive"]:
+            if v not in candidates:
+                candidates.append(v)
+        return candidates
+
+    async def stream_tts(
+        self,
+        text_stream: AsyncGenerator[str, None],
+        sample_rate: int = 8000,
+    ) -> AsyncGenerator[bytes, None]:
+        if not self.api_key:
+            logger.warning("INWORLD_KEY not set - skipping TTS.")
             yield b""
             return
 
+        full_text = ""
+        async for chunk in text_stream:
+            if chunk:
+                full_text += chunk
+
+        if not full_text.strip():
+            yield b""
+            return
+
+        logger.info(f"InworldTTS synthesizing: '{full_text[:80]}...'")
+
         headers = {
-            "Authorization": f"Basic {self.api_key}:{self.api_secret}" # Format depends on exact Inworld auth spec
+            "Authorization": self._auth_header(),
+            "Content-Type": "application/json",
         }
 
         try:
-            async with websockets.connect(self.ws_url, additional_headers=headers) as ws:
-                
-                # 1. Send initial configuration
-                config_msg = {
-                    "type": "config",
-                    "model": self.model,
-                    "voice": self.voice,
-                    "output_format": {
-                        "encoding": "MULAW",
-                        "sample_rate": sample_rate
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                last_error = None
+                for voice_id in self._voice_candidates():
+                    payload = {
+                        "text": full_text,
+                        "modelId": self.model,
+                        "voiceId": voice_id,
+                        "audioConfig": {
+                            "audioEncoding": "MULAW",
+                            "sampleRateHertz": sample_rate,
+                            "speakingRate": self.speaking_rate,
+                        },
+                        "temperature": self.temperature,
                     }
-                }
-                await ws.send(json.dumps(config_msg))
 
-                # 2. Start a task to receive audio chunks
-                async def receiver():
-                    audio_chunks = []
-                    async for message in ws:
-                        if isinstance(message, bytes):
-                            audio_chunks.append(message)
-                        else:
-                            data = json.loads(message)
-                            if data.get("type") == "audio":
-                                # If Base64 encoded inside JSON (depends on API spec)
-                                pass
-                            elif data.get("type") == "done":
-                                break
-                    return audio_chunks
+                    response = await client.post(
+                        f"{self.base_url}/tts/v1/voice",
+                        headers=headers,
+                        json=payload,
+                    )
 
-                receive_task = asyncio.create_task(receiver())
+                    # Fallback: retry with minimal payload if optional controls are rejected
+                    if response.status_code >= 400 and response.status_code < 500:
+                        minimal_payload = {
+                            "text": full_text,
+                            "modelId": self.model,
+                            "voiceId": voice_id,
+                            "audioConfig": {
+                                "audioEncoding": "MULAW",
+                                "sampleRateHertz": sample_rate,
+                            },
+                        }
+                        response = await client.post(
+                            f"{self.base_url}/tts/v1/voice",
+                            headers=headers,
+                            json=minimal_payload,
+                        )
 
-                # 3. Stream text tokens to the WebSocket as they arrive
-                async for chunk in text_stream:
-                    if chunk:
-                        text_msg = {"type": "text", "text": chunk}
-                        await ws.send(json.dumps(text_msg))
-                        
-                # 4. Signal end of text stream
-                await ws.send(json.dumps({"type": "eof"}))
+                    if response.status_code == 200:
+                        body = response.json()
+                        audio_b64 = body.get("audioContent", "")
+                        if not audio_b64:
+                            last_error = "InworldTTS response missing audioContent"
+                            continue
 
-                # 5. Yield received audio
-                audio_chunks = await receive_task
-                for chunk in audio_chunks:
-                    yield chunk
+                        chunk_size = 320
+                        audio = base64.b64decode(audio_b64)
+                        logger.info(
+                            f"InworldTTS voice={voice_id} received {len(audio)} bytes of audio"
+                        )
+                        for i in range(0, len(audio), chunk_size):
+                            yield audio[i : i + chunk_size]
+                            await asyncio.sleep(0)
+                        return
 
-        except Exception as e:
-            logger.error(f"Inworld TTS WebSocket Exception: {e}", exc_info=True)
+                    last_error = f"voice={voice_id} status={response.status_code} body={response.text[:220]}"
+
+                logger.error(f"InworldTTS failed on all voice candidates: {last_error}")
+                yield b""
+
+        except Exception as exc:
+            logger.error(f"InworldTTS exception: {exc}", exc_info=True)
             yield b""

@@ -1,139 +1,317 @@
-import re
-import logging
 import datetime
-from typing import TypedDict, Annotated, List, Literal
+import logging
+import re
+import unicodedata
+from typing import Annotated, List, Literal, TypedDict
 
-from langgraph.graph import StateGraph, START, END
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langgraph.graph import END, START, StateGraph
 
 from src.db.policy_rag import rag as policy_rag
 
 logger = logging.getLogger(__name__)
 
 
+ROOM_PRICES_EUR = {
+    "standard": 80,
+    "deluxe": 110,
+    "suite": 150,
+    "familiale": 130,
+}
+
+
+def _room_price_eur(room_type: str | None) -> int:
+    key = (room_type or "standard").lower()
+    return ROOM_PRICES_EUR.get(key, ROOM_PRICES_EUR["standard"])
+
+
+def _strip_accents(value: str) -> str:
+    return ''.join(c for c in unicodedata.normalize('NFD', value) if unicodedata.category(c) != 'Mn')
+
+
+def _word_to_int(token: str) -> int | None:
+    mapping = {
+        'un': 1,
+        'une': 1,
+        'deux': 2,
+        'trois': 3,
+        'quatre': 4,
+        'cinq': 5,
+    }
+    return mapping.get(token)
+
+
 class ChatState(TypedDict):
-    """
-    State representing the current conversation and booking context.
-    """
+    """Conversation state for booking flow."""
+
     messages: Annotated[List[BaseMessage], "The conversation history"]
-    stage: str  # greeting, dates_collection, availability_check, confirmation, done
+    stage: str  # greeting, details_collection, availability_check, confirmation, done
     check_in_date: str | None
     check_out_date: str | None
+    nights: int | None
     guests: int | None
+    room_type: str | None
     room_available: bool | None
 
 
-SYSTEM_PROMPT = """You are a polite, helpful, and concise virtual hotel receptionist for GuestFlow Hotel.
-Your job is to help users book a room.
-Keep your answers brief as they are spoken over the phone.
-If you need more info (dates, guests), ask one question at a time.
-Once you have the check-in date, check-out date, and number of guests, confirm the details.
-Do not invent room details until given confirmation."""
+SYSTEM_PROMPT = """Tu es l'agent vocal de reservation de GuestFlow Hotel.
+
+Objectif principal:
+- Qualifier et finaliser une reservation avec une conversation fluide, professionnelle et dynamique.
+
+Langue et ton:
+- Reponds toujours en francais naturel (sauf demande explicite d'une autre langue).
+- Reste chaleureux, premium, concis, et adapte a l'oral telephone.
+- Une seule question ciblee a la fois.
+
+Champs de reservation a collecter:
+1) Date d'arrivee
+2) Date de depart OU nombre de nuitees
+3) Nombre de personnes
+4) Type de chambre (standard, suite, deluxe, familiale)
+
+Regles de conduite:
+- N'invente jamais la disponibilite ni la politique hoteliere.
+- Appuie-toi uniquement sur les messages systeme injectes par les outils.
+- PRIORITE ABSOLUE: reponds d'abord a la derniere question du client.
+- Si le client demande le prix/tarif/cout, donne d'abord le prix (EUR/nuit + total), puis propose la confirmation en une seule phrase.
+- Ne repete jamais en boucle: "Souhaitez-vous confirmer...".
+- Si une information manque, demande uniquement cette information.
+- Ne salue jamais a nouveau apres le message de bienvenue initial.
+- Ne fais pas de recapitulatif complet a chaque tour; fais-le uniquement quand la disponibilite est confirmee, puis demande la confirmation.
+- Quand la disponibilite est confirmee, annonce le prix en euros (prix/nuit et total) puis propose une offre commerciale pertinente.
+- Utilise des techniques de negociation douces: valoriser l'offre, creer de la confiance, proposer une option avantageuse (ex: petit-dejeuner inclus).
+- Si indisponible, excuse-toi et propose des alternatives concretes (autres dates / autre type de chambre).
+"""
 
 
-# ---------------------------------------------------------------------------
-# Helpers: date & guest extraction from natural language
-# ---------------------------------------------------------------------------
+def _safe_date(year: int, month: int, day: int) -> datetime.date | None:
+    try:
+        return datetime.date(year, month, day)
+    except ValueError:
+        return None
+
 
 def _parse_date(text: str, reference: datetime.date | None = None) -> str | None:
-    """Extract a date mention from text. Returns ISO string or None."""
-    today = datetime.date.today()
-    text = text.lower()
+    today = reference or datetime.date.today()
+    low = text.lower().strip()
 
-    if "today" in text:
+    if "aujourd'hui" in low or "today" in low:
         return str(today)
-    if "tomorrow" in text:
+    if "demain" in low or "tomorrow" in low:
         return str(today + datetime.timedelta(days=1))
-    if "day after tomorrow" in text:
+    if "apres-demain" in low or "apr?s-demain" in low or "day after tomorrow" in low:
         return str(today + datetime.timedelta(days=2))
 
-    # "in X days"
-    m = re.search(r"in\s+(\d+)\s+days?", text)
+    m = re.search(r"(?:dans|in)\s+(\d+)\s+(?:jours?|days?)", low)
     if m:
         return str(today + datetime.timedelta(days=int(m.group(1))))
 
-    # "next monday/tuesday/..."
-    weekdays = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
-    for i, day_name in enumerate(weekdays):
-        if f"next {day_name}" in text or day_name in text:
-            days_ahead = (i - today.weekday() + 7) % 7 or 7
+    weekdays = {
+        "lundi": 0,
+        "monday": 0,
+        "mardi": 1,
+        "tuesday": 1,
+        "mercredi": 2,
+        "wednesday": 2,
+        "jeudi": 3,
+        "thursday": 3,
+        "vendredi": 4,
+        "friday": 4,
+        "samedi": 5,
+        "saturday": 5,
+        "dimanche": 6,
+        "sunday": 6,
+    }
+    for name, idx in weekdays.items():
+        if f"next {name}" in low or f"{name} prochain" in low or re.search(rf"\b{name}\b", low):
+            days_ahead = (idx - today.weekday() + 7) % 7 or 7
             return str(today + datetime.timedelta(days=days_ahead))
 
-    # ISO date: YYYY-MM-DD
-    m = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", text)
+    m = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", low)
     if m:
         return m.group(1)
 
-    # "March 20", "20 March", "20/03", "03/20"
+    m = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b", low)
+    if m:
+        day = int(m.group(1))
+        month = int(m.group(2))
+        year = int(m.group(3)) if m.group(3) else today.year
+        if year < 100:
+            year += 2000
+        candidate = _safe_date(year, month, day)
+        if not candidate:
+            return None
+        if not m.group(3) and candidate < today:
+            candidate = _safe_date(today.year + 1, month, day)
+        return str(candidate) if candidate else None
+
     months = {
-        "january": 1, "february": 2, "march": 3, "april": 4,
-        "may": 5, "june": 6, "july": 7, "august": 8,
-        "september": 9, "october": 10, "november": 11, "december": 12,
+        "janvier": 1,
+        "january": 1,
+        "fevrier": 2,
+        "f?vrier": 2,
+        "february": 2,
+        "mars": 3,
+        "march": 3,
+        "avril": 4,
+        "april": 4,
+        "mai": 5,
+        "may": 5,
+        "juin": 6,
+        "june": 6,
+        "juillet": 7,
+        "july": 7,
+        "aout": 8,
+        "ao?t": 8,
+        "august": 8,
+        "septembre": 9,
+        "september": 9,
+        "octobre": 10,
+        "october": 10,
+        "novembre": 11,
+        "november": 11,
+        "decembre": 12,
+        "d?cembre": 12,
+        "december": 12,
     }
     for month_name, month_num in months.items():
-        patterns = [
-            rf"{month_name}\s+(\d{{1,2}})",
-            rf"(\d{{1,2}})\s+{month_name}",
-        ]
-        for pat in patterns:
-            m = re.search(pat, text)
-            if m:
-                day = int(m.group(1))
-                year = today.year
-                candidate = datetime.date(year, month_num, day)
-                if candidate < today:
-                    candidate = datetime.date(year + 1, month_num, day)
-                return str(candidate)
+        for pat in [rf"{month_name}\s+(\d{{1,2}})", rf"(\d{{1,2}})\s+{month_name}"]:
+            m = re.search(pat, low)
+            if not m:
+                continue
+            day = int(m.group(1))
+            candidate = _safe_date(today.year, month_num, day)
+            if not candidate:
+                continue
+            if candidate < today:
+                candidate = _safe_date(today.year + 1, month_num, day)
+            return str(candidate) if candidate else None
 
     return None
 
 
 def _parse_nights(text: str) -> int | None:
-    """Extract number of nights from text."""
-    m = re.search(r"(\d+)\s*nights?", text.lower())
+    low = text.lower()
+    m = re.search(r"(\d+)\s*(?:nuits?|nights?)", low)
     if m:
         return int(m.group(1))
-    words = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-             "six": 6, "seven": 7, "a week": 7}
+
+    words = {
+        "une nuit": 1,
+        "one night": 1,
+        "deux": 2,
+        "two": 2,
+        "trois": 3,
+        "three": 3,
+        "quatre": 4,
+        "four": 4,
+        "cinq": 5,
+        "five": 5,
+        "une semaine": 7,
+        "a week": 7,
+    }
     for word, num in words.items():
-        if word in text.lower():
+        if word in low:
             return num
     return None
 
 
 def _parse_guests(text: str) -> int | None:
-    """Extract number of guests from text."""
-    m = re.search(r"(\d+)\s*(person|people|guest|adult|pax|passenger)", text.lower())
+    low = text.lower()
+    norm = _strip_accents(low)
+
+    # Pattern: "2 adultes et 1 enfant" -> 3
+    parts = re.findall(r"(\d+)\s*(adultes?|adults?|personnes?|people|enfants?|children|kids?|kid|bebes?|bebes)", norm)
+    if parts:
+        total = sum(int(n) for n, _ in parts)
+        if total > 0:
+            return total
+
+    # Pattern with number words: "trois personnes"
+    m_words = re.search(
+        r"\b(un|une|deux|trois|quatre|cinq)\s*(?:personne|personnes|adultes?|guests?|people|pax|clients?)\b",
+        norm,
+    )
+    if m_words:
+        v = _word_to_int(m_words.group(1))
+        if v:
+            return v
+
+    # Pattern with digits: "3 personnes"
+    m = re.search(
+        r"(\d+)\s*(?:personne|personnes|adultes?|guests?|people|pax|clients?)",
+        norm,
+    )
     if m:
         return int(m.group(1))
-    words = {"just me": 1, "myself": 1, "alone": 1,
-             "two": 2, "couple": 2, "three": 3, "four": 4}
+
+    # Special: "un couple et un enfant" / "couple avec enfant"
+    if 'couple' in norm and any(k in norm for k in ['enfant', 'enfants', 'child', 'children', 'kid', 'kids', 'bebe', 'bebes']):
+        return 3
+
+    words = {
+        'seul': 1,
+        'seule': 1,
+        'just me': 1,
+        'couple': 2,
+        'deux': 2,
+        'two': 2,
+        'trois': 3,
+        'three': 3,
+        'quatre': 4,
+        'four': 4,
+    }
     for word, num in words.items():
-        if word in text.lower():
+        if word in norm:
             return num
     return None
 
 
+def _parse_room_type(text: str) -> str | None:
+    low = text.lower()
+
+    # Priority order from specific to generic
+    if any(k in low for k in ["suite", "junior suite"]):
+        return "suite"
+    if any(k in low for k in ["deluxe", "de luxe"]):
+        return "deluxe"
+    if any(k in low for k in ["familiale", "family", "family room"]):
+        return "familiale"
+    if any(k in low for k in ["standard", "classique"]):
+        return "standard"
+
+    return None
+
+
 def _is_policy_question(text: str) -> bool:
-    """Returns True if the user is asking about hotel policies."""
+    low = text.lower()
     policy_keywords = [
-        "pet", "dog", "cat", "breakfast", "food", "cancel", "refund",
-        "check-in time", "checkout time", "check out time", "check in time",
-        "late", "early", "parking", "wifi", "policy", "rule",
+        "pet",
+        "dog",
+        "cat",
+        "animaux",
+        "breakfast",
+        "petit dejeuner",
+        "petit-d?jeuner",
+        "cancel",
+        "annulation",
+        "refund",
+        "remboursement",
+        "check-in",
+        "check-out",
+        "horaire",
+        "heure",
+        "parking",
+        "wifi",
+        "politique",
+        "regle",
+        "r?gle",
     ]
-    text_lower = text.lower()
-    return any(kw in text_lower for kw in policy_keywords)
+    return any(k in low for k in policy_keywords)
 
-
-# ---------------------------------------------------------------------------
-# LangGraph Nodes
-# ---------------------------------------------------------------------------
 
 def parse_intent_node(state: ChatState) -> dict:
-    """
-    Parses the last user message to extract dates, guests, and stage transitions.
-    Updates state fields without calling the LLM (fast, no-latency node).
-    """
     if not state["messages"]:
         return {"stage": "greeting"}
 
@@ -144,68 +322,125 @@ def parse_intent_node(state: ChatState) -> dict:
     text = last_msg.content
     updates: dict = {}
 
-    # --- Extract check-in date ---
-    if state["check_in_date"] is None:
-        ci = _parse_date(text)
-        if ci:
+    # Allow check-in update when user explicitly gives new stay dates
+    ci = _parse_date(text)
+    if ci:
+        ci_keywords = [
+            "du ",
+            "arrive",
+            "arriv?e",
+            "check-in",
+            "checkin",
+            "s?jour",
+            "sejour",
+        ]
+        if state["check_in_date"] is None or any(k in text.lower() for k in ci_keywords):
+            if str(ci) != str(state.get("check_in_date")):
+                logger.info(f"Detected check-in update: {state.get('check_in_date')} -> {ci}")
             updates["check_in_date"] = ci
-            logger.info(f"Detected check-in: {ci}")
 
-    # --- Extract nights → compute check-out ---
-    if state.get("check_in_date") or updates.get("check_in_date"):
-        ci_str = updates.get("check_in_date") or state["check_in_date"]
-        if state["check_out_date"] is None:
-            nights = _parse_nights(text)
-            if nights:
+    # Allow guest count updates if user changes preference mid-conversation
+    guests = _parse_guests(text)
+    if guests:
+        if guests != state.get("guests"):
+            logger.info(f"Detected guests update: {state.get('guests')} -> {guests}")
+        updates["guests"] = guests
+
+    # Always re-parse room type so user can switch alternative (suite/standard/etc.)
+    room_type = _parse_room_type(text)
+    if room_type:
+        if room_type != state.get("room_type"):
+            logger.info(f"Detected room_type update: {state.get('room_type')} -> {room_type}")
+        updates["room_type"] = room_type
+
+    ci_str = updates.get("check_in_date") or state.get("check_in_date")
+
+    if ci_str:
+        # explicit departure date (allow updates if user changes dates)
+        if any(k in text.lower() for k in ["depart", "d?part", "check-out", "checkout", "departure", " au "]):
+            maybe_co = _parse_date(text)
+            if maybe_co:
                 ci = datetime.date.fromisoformat(ci_str)
-                co = ci + datetime.timedelta(days=nights)
-                updates["check_out_date"] = str(co)
-                logger.info(f"Computed check-out: {co} ({nights} nights)")
+                co = datetime.date.fromisoformat(maybe_co)
+                if co > ci:
+                    if str(co) != str(state.get("check_out_date")):
+                        logger.info(
+                            f"Detected check-out update: {state.get('check_out_date')} -> {co} ({(co - ci).days} nights)"
+                        )
+                    updates["check_out_date"] = str(co)
+                    updates["nights"] = (co - ci).days
 
-    # --- Extract guests ---
-    if state["guests"] is None:
-        guests = _parse_guests(text)
-        if guests:
-            updates["guests"] = guests
-            logger.info(f"Detected guests: {guests}")
+        # nights -> compute checkout (allow updates when user says new nights)
+        nights = _parse_nights(text)
+        if nights:
+            ci = datetime.date.fromisoformat(ci_str)
+            co = ci + datetime.timedelta(days=nights)
+            if str(co) != str(state.get("check_out_date")):
+                logger.info(
+                    f"Computed check-out update: {state.get('check_out_date')} -> {co} ({nights} nights)"
+                )
+            updates["check_out_date"] = str(co)
+            updates["nights"] = nights
 
-    # --- Stage transition ---
-    ci = updates.get("check_in_date") or state["check_in_date"]
-    co = updates.get("check_out_date") or state["check_out_date"]
-    guests = updates.get("guests") or state["guests"]
+    # stage transition
+    ci = updates.get("check_in_date") or state.get("check_in_date")
+    co = updates.get("check_out_date") or state.get("check_out_date")
+    guests = updates.get("guests") or state.get("guests")
+    room_type = updates.get("room_type") or state.get("room_type")
+
+    booking_fields_changed = any(
+        k in updates for k in ("check_in_date", "check_out_date", "nights", "guests", "room_type")
+    )
 
     if state["stage"] == "greeting":
-        updates["stage"] = "dates_collection"
-    elif ci and co and guests:
+        updates["stage"] = "details_collection"
+    elif state["stage"] == "done":
+        pass
+    elif ci and co and guests and room_type and (
+        state["stage"] == "details_collection" or booking_fields_changed
+    ):
         updates["stage"] = "availability_check"
-    
+
     return updates
 
 
 def check_availability_node(state: ChatState) -> dict:
-    """
-    Checks room availability in SQLite and appends the result to messages
-    so the LLM can use it in its next spoken response.
-    """
     from src.db.sql_stock import check_availability
 
     ci = datetime.date.fromisoformat(state["check_in_date"])
     co = datetime.date.fromisoformat(state["check_out_date"])
+    room_type = state.get("room_type") or "standard"
 
-    available = check_availability(ci, co)
-    logger.info(f"Availability check {ci} → {co}: {available}")
+    available = check_availability(ci, co, room_type=room_type)
+    logger.info(f"Availability check {ci} -> {co} room_type={room_type}: {available}")
+
+    nights = state.get("nights")
+    if nights is None:
+        nights = (co - ci).days
 
     if available:
-        tool_msg = AIMessage(content=(
-            f"[System] Room available from {state['check_in_date']} to "
-            f"{state['check_out_date']} for {state['guests']} guest(s). "
-            "Confirm the booking with the user."
-        ))
+        price_per_night_eur = _room_price_eur(room_type)
+        total_price_eur = price_per_night_eur * nights
+        breakfast_offer = (
+            "Offre speciale: petit-dejeuner inclus pour tous les voyageurs sans supplement."
+        )
+        tool_msg = AIMessage(
+            content=(
+                f"[System] Disponibilite OK pour une chambre {room_type} du {state['check_in_date']} "
+                f"au {state['check_out_date']} ({nights} nuit(s)) pour {state['guests']} personne(s). "
+                f"Tarif: {price_per_night_eur} EUR par nuit, soit {total_price_eur} EUR au total. "
+                f"{breakfast_offer} "
+                "Adopte une formulation commerciale premium et negocie en douceur pour conclure la reservation. Si le client pose une question (ex: prix), reponds d'abord a sa question avant toute demande de confirmation, sans repetition."
+            )
+        )
     else:
-        tool_msg = AIMessage(content=(
-            f"[System] No rooms available from {state['check_in_date']} to "
-            f"{state['check_out_date']}. Apologise and ask for alternative dates."
-        ))
+        tool_msg = AIMessage(
+            content=(
+                f"[System] Aucune chambre {room_type} disponible du {state['check_in_date']} "
+                f"au {state['check_out_date']} ({nights} nuit(s)). "
+                "Presente des excuses et propose une alternative de date ou de type de chambre."
+            )
+        )
 
     return {
         "room_available": available,
@@ -215,37 +450,25 @@ def check_availability_node(state: ChatState) -> dict:
 
 
 def query_policy_node(state: ChatState) -> dict:
-    """
-    Answers hotel policy questions using the PolicyRAG knowledge base.
-    Injects the answer as a system message so the LLM can relay it naturally.
-    """
     last_msg = state["messages"][-1].content if state["messages"] else ""
     answer = policy_rag.query(last_msg)
     logger.info(f"PolicyRAG answer: {answer}")
 
-    tool_msg = AIMessage(content=f"[System] Policy info for user: {answer}")
+    tool_msg = AIMessage(content=f"[System] Information politique hoteliere: {answer}")
     return {"messages": state["messages"] + [tool_msg]}
 
 
 def route_after_parse(state: ChatState) -> Literal["check_availability", "query_policy", "end"]:
-    """Conditional routing after parsing intent."""
     last_msg = state["messages"][-1] if state["messages"] else None
-    if last_msg and isinstance(last_msg, HumanMessage):
-        if _is_policy_question(last_msg.content):
-            return "query_policy"
+    if last_msg and isinstance(last_msg, HumanMessage) and _is_policy_question(last_msg.content):
+        return "query_policy"
 
-    # Trigger availability check as soon as we have both dates (guests optional —
-    # the LLM will ask verbally if still missing).
     if state["stage"] == "availability_check":
-        if state["check_in_date"] and state["check_out_date"]:
+        if state.get("check_in_date") and state.get("check_out_date") and state.get("guests") and state.get("room_type"):
             return "check_availability"
 
     return "end"
 
-
-# ---------------------------------------------------------------------------
-# Build graph
-# ---------------------------------------------------------------------------
 
 def build_graph() -> StateGraph:
     graph = StateGraph(ChatState)

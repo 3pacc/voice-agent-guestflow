@@ -1,5 +1,5 @@
 fastapi>=0.115.0
-fastrtc
+fastrtc>=0.2.0
 uvicorn>=0.30.6
 twilio>=9.3.2
 pydantic[email]>=2.9.2
