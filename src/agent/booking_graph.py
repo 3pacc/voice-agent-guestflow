@@ -12,19 +12,6 @@ from src.db.policy_rag import rag as policy_rag
 logger = logging.getLogger(__name__)
 
 
-ROOM_PRICES_EUR = {
-    "standard": 80,
-    "deluxe": 110,
-    "suite": 150,
-    "familiale": 130,
-}
-
-
-def _room_price_eur(room_type: str | None) -> int:
-    key = (room_type or "standard").lower()
-    return ROOM_PRICES_EUR.get(key, ROOM_PRICES_EUR["standard"])
-
-
 def _strip_accents(value: str) -> str:
     return ''.join(c for c in unicodedata.normalize('NFD', value) if unicodedata.category(c) != 'Mn')
 
@@ -52,6 +39,9 @@ class ChatState(TypedDict):
     guests: int | None
     room_type: str | None
     room_available: bool | None
+    available_rooms: int | None
+    price_per_night_eur: int | None
+    total_price_eur: int | None
 
 
 SYSTEM_PROMPT = """Tu es l'agent vocal de reservation de GuestFlow Hotel.
@@ -73,6 +63,7 @@ Champs de reservation a collecter:
 Regles de conduite:
 - N'invente jamais la disponibilite ni la politique hoteliere.
 - Appuie-toi uniquement sur les messages systeme injectes par les outils.
+- Les tarifs et disponibilites proviennent exclusivement de la base de donnees hoteliere.
 - PRIORITE ABSOLUE: reponds d'abord a la derniere question du client.
 - Si le client demande le prix/tarif/cout, donne d'abord le prix (EUR/nuit + total), puis propose la confirmation en une seule phrase.
 - Ne repete jamais en boucle: "Souhaitez-vous confirmer...".
@@ -90,6 +81,40 @@ def _safe_date(year: int, month: int, day: int) -> datetime.date | None:
         return datetime.date(year, month, day)
     except ValueError:
         return None
+
+
+def _parse_date_range(text: str, reference: datetime.date | None = None) -> tuple[str | None, str | None]:
+    """Parse expressions like 'du 20 au 22 mars' or 'du 20/03 au 22/03'."""
+    today = reference or datetime.date.today()
+    low = _strip_accents((text or '').lower())
+
+    m = re.search(r"du\s+(\d{1,2})(?:[/-](\d{1,2}))?\s+au\s+(\d{1,2})(?:[/-](\d{1,2}))?(?:[/-](\d{2,4}))?", low)
+    if not m:
+        return (None, None)
+
+    d1 = int(m.group(1))
+    m1 = int(m.group(2)) if m.group(2) else None
+    d2 = int(m.group(3))
+    m2 = int(m.group(4)) if m.group(4) else m1
+    y = int(m.group(5)) if m.group(5) else today.year
+    if y < 100:
+        y += 2000
+
+    if not m1 or not m2:
+        month_guess = today.month
+        m1 = m1 or month_guess
+        m2 = m2 or month_guess
+
+    ci = _safe_date(y, m1, d1)
+    co = _safe_date(y, m2, d2)
+    if not ci or not co:
+        return (None, None)
+    if co <= ci:
+        co = _safe_date(y + 1, m2, d2)
+        if not co or co <= ci:
+            return (None, None)
+
+    return (str(ci), str(co))
 
 
 def _parse_date(text: str, reference: datetime.date | None = None) -> str | None:
@@ -322,6 +347,19 @@ def parse_intent_node(state: ChatState) -> dict:
     text = last_msg.content
     updates: dict = {}
 
+    # Parse date range first when user gives both dates in one sentence.
+    range_ci, range_co = _parse_date_range(text)
+    if range_ci and range_co:
+        if str(range_ci) != str(state.get("check_in_date")):
+            logger.info(f"Detected check-in update: {state.get('check_in_date')} -> {range_ci}")
+        if str(range_co) != str(state.get("check_out_date")):
+            logger.info(f"Detected check-out update: {state.get('check_out_date')} -> {range_co}")
+        updates["check_in_date"] = range_ci
+        updates["check_out_date"] = range_co
+        ci_dt = datetime.date.fromisoformat(range_ci)
+        co_dt = datetime.date.fromisoformat(range_co)
+        updates["nights"] = (co_dt - ci_dt).days
+
     # Allow check-in update when user explicitly gives new stay dates
     ci = _parse_date(text)
     if ci:
@@ -400,51 +438,72 @@ def parse_intent_node(state: ChatState) -> dict:
         state["stage"] == "details_collection" or booking_fields_changed
     ):
         updates["stage"] = "availability_check"
+        updates["room_available"] = None
+        updates["available_rooms"] = None
+        updates["price_per_night_eur"] = None
+        updates["total_price_eur"] = None
 
     return updates
 
 
 def check_availability_node(state: ChatState) -> dict:
-    from src.db.sql_stock import check_availability
+    from src.db.sql_stock import check_availability_details
 
     ci = datetime.date.fromisoformat(state["check_in_date"])
     co = datetime.date.fromisoformat(state["check_out_date"])
     room_type = state.get("room_type") or "standard"
+    guests = state.get("guests")
 
-    available = check_availability(ci, co, room_type=room_type)
-    logger.info(f"Availability check {ci} -> {co} room_type={room_type}: {available}")
+    details = check_availability_details(ci, co, room_type=room_type, guests=guests)
+    available = bool(details.get("available"))
+    nights = int(details.get("nights") or max((co - ci).days, 0))
+    available_rooms = int(details.get("min_available_rooms") or 0)
+    price_per_night_eur = details.get("price_per_night_eur")
+    total_price_eur = details.get("total_price_eur")
 
-    nights = state.get("nights")
-    if nights is None:
-        nights = (co - ci).days
+    logger.info(
+        "Availability check %s -> %s room_type=%s guests=%s => %s",
+        ci,
+        co,
+        room_type,
+        guests,
+        details,
+    )
 
     if available:
-        price_per_night_eur = _room_price_eur(room_type)
-        total_price_eur = price_per_night_eur * nights
-        breakfast_offer = (
-            "Offre speciale: petit-dejeuner inclus pour tous les voyageurs sans supplement."
-        )
         tool_msg = AIMessage(
             content=(
-                f"[System] Disponibilite OK pour une chambre {room_type} du {state['check_in_date']} "
-                f"au {state['check_out_date']} ({nights} nuit(s)) pour {state['guests']} personne(s). "
-                f"Tarif: {price_per_night_eur} EUR par nuit, soit {total_price_eur} EUR au total. "
-                f"{breakfast_offer} "
-                "Adopte une formulation commerciale premium et negocie en douceur pour conclure la reservation. Si le client pose une question (ex: prix), reponds d'abord a sa question avant toute demande de confirmation, sans repetition."
+                f"[System] Disponibilite OK (source DB) pour une chambre {details.get('room_type')} du {state['check_in_date']} "
+                f"au {state['check_out_date']} ({nights} nuit(s)) pour {state.get('guests')} personne(s). "
+                f"Stock minimum restant sur la periode: {available_rooms} chambre(s). "
+                f"Tarif ferme DB: {price_per_night_eur} EUR par nuit, soit {total_price_eur} EUR au total. "
+                "Reponds de facon concise et commerciale, sans inventer d'autres tarifs."
             )
         )
+        next_stage = "confirmation"
     else:
+        alternatives = details.get("alternatives") or []
+        alt_text = ", ".join(
+            f"{a.get('room_type')} (cap {a.get('capacity')}, {a.get('price_eur')} EUR/nuit)" for a in alternatives[:3]
+        )
+        if not alt_text:
+            alt_text = "aucune alternative immediate"
         tool_msg = AIMessage(
             content=(
-                f"[System] Aucune chambre {room_type} disponible du {state['check_in_date']} "
+                f"[System] Disponibilite KO (source DB) pour une chambre {details.get('room_type')} du {state['check_in_date']} "
                 f"au {state['check_out_date']} ({nights} nuit(s)). "
-                "Presente des excuses et propose une alternative de date ou de type de chambre."
+                f"Motif: {details.get('reason')}. Alternatives possibles: {alt_text}. "
+                "Propose une alternative concrete sans demander confirmation maintenant."
             )
         )
+        next_stage = "details_collection"
 
     return {
         "room_available": available,
-        "stage": "confirmation",
+        "available_rooms": available_rooms,
+        "price_per_night_eur": price_per_night_eur,
+        "total_price_eur": total_price_eur,
+        "stage": next_stage,
         "messages": state["messages"] + [tool_msg],
     }
 

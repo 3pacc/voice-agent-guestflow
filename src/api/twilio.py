@@ -17,6 +17,8 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from src.agent.booking_graph import SYSTEM_PROMPT, booking_agent
 from src.config.settings import settings
+from src.db.live_store import append_call_event, append_reservation, append_transcript
+from src.db.sql_stock import ensure_horizon
 from src.llm.vllm_client import VllmClient
 from src.stt.mistral_stt import MistralRealtimeSTT
 from src.tts.inworld_tts import InworldTTS
@@ -84,6 +86,8 @@ def _is_confirmation_intent(text: str) -> bool:
 
     patterns = [
         r'\boui\b',
+        r'\bok\b',
+        r'\bokay\b',
         r'\bouais\b',
         r'\byeah\b',
         r'\byep\b',
@@ -130,6 +134,26 @@ def _build_confirmation_question(state: dict) -> str:
     return (
         "Parfait, la chambre est disponible. "
         "Souhaitez-vous confirmer la r\u00e9servation pour recevoir le SMS de finalisation ?"
+    )
+
+
+def _build_pricing_context_reply(state: dict) -> str:
+    room_type = state.get('room_type') or 'standard'
+    nights = state.get('nights') or 'N/A'
+    guests = state.get('guests') or 'N/A'
+    per_night = state.get('price_per_night_eur')
+    total = state.get('total_price_eur')
+
+    if per_night and total:
+        return (
+            f"Pour la chambre {room_type}, le tarif base DB est de {per_night} euros par nuit, "
+            f"soit {total} euros au total pour {nights} nuit(s) et {guests} personne(s). "
+            "Si cela vous convient, je peux confirmer maintenant et vous envoyer le SMS de finalisation."
+        )
+
+    return (
+        "Je vais verifier le tarif exact dans la base de donnees avant confirmation. "
+        "Pouvez-vous me confirmer le type de chambre et les dates ?"
     )
 
 
@@ -274,6 +298,9 @@ async def twilio_media_stream(websocket: WebSocket):
         'room_type': None,
         'nights': None,
         'room_available': None,
+        'available_rooms': None,
+        'price_per_night_eur': None,
+        'total_price_eur': None,
         'reservation_confirmed': False,
         'reservation_ref': None,
         'sms_sent': False,
@@ -308,6 +335,7 @@ async def twilio_media_stream(websocket: WebSocket):
                 return
 
             logger.info(f"User said: '{user_text}'")
+            append_transcript(call_sid, "user", user_text)
 
             conv_state['turn_count'] = int(conv_state.get('turn_count', 0)) + 1
             final_response_override = None
@@ -325,10 +353,7 @@ async def twilio_media_stream(websocket: WebSocket):
                 has_booking_fields
                 and not conv_state.get('reservation_confirmed')
                 and _is_confirmation_intent(user_text)
-                and (
-                    conv_state.get('room_available') is True
-                    or conv_state.get('stage') == 'confirmation'
-                )
+                and conv_state.get('room_available') is True
             )
             _trace(
                 'finalization_gate',
@@ -377,6 +402,8 @@ async def twilio_media_stream(websocket: WebSocket):
                     guests=conv_state.get('guests'),
                     room_type=conv_state.get('room_type'),
                 )
+                append_call_event(call_sid, 'booking_finalized', {'reservation_ref': reservation_ref, 'sms_sent': sms_sent, 'sms_status': sms_result.get('status'), 'sms_error': sms_result.get('error'), 'check_in_date': conv_state.get('check_in_date'), 'check_out_date': conv_state.get('check_out_date'), 'nights': conv_state.get('nights'), 'guests': conv_state.get('guests'), 'room_type': conv_state.get('room_type')})
+                append_reservation({'call_sid': call_sid, 'reservation_ref': reservation_ref, 'sms_sent': sms_sent, 'sms_status': sms_result.get('status'), 'sms_error': sms_result.get('error'), 'check_in_date': conv_state.get('check_in_date'), 'check_out_date': conv_state.get('check_out_date'), 'nights': conv_state.get('nights'), 'guests': conv_state.get('guests'), 'room_type': conv_state.get('room_type')})
 
                 if sms_sent:
                     tool_msg = AIMessage(
@@ -406,6 +433,7 @@ async def twilio_media_stream(websocket: WebSocket):
             elif conv_state.get('room_available') is True and not conv_state.get('reservation_confirmed'):
                 if _is_price_or_info_intent(user_text):
                     _trace('confirmation_deferred_for_question', user_text=user_text)
+                    final_response_override = _build_pricing_context_reply(conv_state)
                 else:
                     final_response_override = _build_confirmation_question(conv_state)
 
@@ -432,6 +460,8 @@ async def twilio_media_stream(websocket: WebSocket):
             response_text = _sanitize_agent_response(response_text, allow_greeting=False)
             if not response_text:
                 response_text = "Je vous \u00e9coute."
+
+            append_transcript(call_sid, "agent", response_text)
 
             sent_chunks = 0
             async for audio_chunk in tts.stream_tts(_single_text_stream(response_text)):
@@ -484,10 +514,12 @@ async def twilio_media_stream(websocket: WebSocket):
                     fallback = (settings.booking_sms_fallback_to or '').strip()
                     caller_number = fallback or None
 
+                ensure_horizon(days=90)
                 logger.info(f'Stream started - SID: {stream_sid}')
                 if caller_number:
                     logger.info(f'Caller number available for SMS: {caller_number}')
                 _trace('call_started', stream_sid=stream_sid, call_sid=call_sid, caller_number=caller_number)
+                append_call_event(call_sid, 'call_started', {'stream_sid': stream_sid, 'caller_number': caller_number})
 
                 greeting_text = (
                     'Bonjour et bienvenue chez GuestFlow Hotel. '
@@ -585,6 +617,7 @@ async def twilio_media_stream(websocket: WebSocket):
 
             elif event == 'stop':
                 logger.info('Twilio stream stopped.')
+                append_call_event(call_sid, 'call_stopped', {'stream_sid': stream_sid})
                 break
 
     except WebSocketDisconnect:
