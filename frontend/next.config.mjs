@@ -1,14 +1,14 @@
-/** @type {import('next').NextConfig} */
-const nextConfig = {
-  reactStrictMode: true,
+export default {
   async rewrites() {
     return [
       {
-        source: '/admin/live/:path*',
-        destination: 'http://127.0.0.1:8000/admin/live/:path*',
+        source: "/api/:path*",
+        destination: "http://127.0.0.1:8000/:path*",
+      },
+      {
+        source: "/admin/:path*",
+        destination: "http://127.0.0.1:8000/admin/:path*",
       },
     ];
   },
 };
-
-export default nextConfig;
