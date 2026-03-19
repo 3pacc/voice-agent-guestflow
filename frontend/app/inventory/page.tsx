@@ -16,6 +16,13 @@ type MonthRow = {
   availability: Record<string, number>;
 };
 
+type InventoryCard = {
+  roomType: string;
+  availableNow: number;
+  averageMonth: number;
+  minMonth: number;
+};
+
 export default function InventoryPage() {
   const today = new Date();
   const [rooms, setRooms] = useState<RoomConf[]>([]);
@@ -52,7 +59,7 @@ export default function InventoryPage() {
         await Promise.all([loadRooms(), loadMonth()]);
         setErr("");
       } catch {
-        setErr("Impossible de charger l'inventaire.");
+        setErr("Impossible de charger l inventaire.");
       }
     };
     load();
@@ -87,17 +94,63 @@ export default function InventoryPage() {
     }
   };
 
+  const deleteCategory = async (roomType: string) => {
+    if (!confirm(`Supprimer la categorie "${roomType}" ? Les donnees de stock restent mais elle ne sera plus proposee.`)) return;
+    try {
+      const res = await fetch(`/admin/live/inventory/rooms/${encodeURIComponent(roomType)}`, { method: "DELETE" });
+      const data = await res.json();
+      if (data.items) setRooms(data.items);
+      setMsg("Categorie supprimee.");
+      setErr("");
+      await loadMonth();
+    } catch {
+      setErr("Echec suppression.");
+    }
+  };
+
+  const toggleBlock = async (r: RoomConf) => {
+    const nextActive = !r.is_active;
+    try {
+      const res = await fetch(`/admin/live/inventory/rooms/${encodeURIComponent(r.room_type)}?is_active=${nextActive}`, { method: "PATCH" });
+      const data = await res.json();
+      if (data.items) setRooms(data.items);
+      setMsg(nextActive ? "Categorie reactivee." : "Categorie bloquee (indisponible).");
+      setErr("");
+      await loadMonth();
+    } catch {
+      setErr("Echec mise a jour statut.");
+    }
+  };
+
+  const inventoryCards = useMemo<InventoryCard[]>(() => {
+    if (!roomTypes.length || !monthRows.length) return [];
+
+    const todayIso = new Date().toISOString().slice(0, 10);
+    const targetRow = monthRows.find((row) => row.date >= todayIso) ?? monthRows[monthRows.length - 1];
+
+    return roomTypes.map((rt) => {
+      const values = monthRows.map((row) => Number(row.availability?.[rt] ?? 0));
+      const sum = values.reduce((acc, n) => acc + n, 0);
+      return {
+        roomType: rt,
+        availableNow: Number(targetRow?.availability?.[rt] ?? 0),
+        averageMonth: Math.round((sum / Math.max(1, values.length)) * 10) / 10,
+        minMonth: values.length ? Math.min(...values) : 0,
+      };
+    });
+  }, [monthRows, roomTypes]);
+
   return (
     <>
-      <h1 className="page-title">Inventaire Hotel</h1>
-      <p className="page-sub">Types de chambres, capacite, prix, et disponibilite mensuelle.</p>
+      <h1 className="page-title">Gestion de l inventaire hotelier</h1>
+      <p className="page-sub">Configuration des categories de chambres et supervision des disponibilites par categorie.</p>
 
       {msg ? <div className="ok small">{msg}</div> : null}
       {err ? <div className="error">{err}</div> : null}
 
       <div className="grid" style={{ marginBottom: 14 }}>
         <div className="card stack">
-          <div className="row"><strong>Configurer un type</strong><span className="badge">DB</span></div>
+          <div className="card-title">Configuration des categories</div>
           <label className="small">Type de chambre</label>
           <input value={form.room_type} onChange={(e) => setForm({ ...form, room_type: e.target.value.toLowerCase().trim() })} />
 
@@ -116,54 +169,57 @@ export default function InventoryPage() {
           </label>
 
           <div className="row" style={{ gap: 8 }}>
-            <button onClick={saveRoom}>Sauvegarder</button>
+            <button onClick={saveRoom}>Enregistrer</button>
             <button onClick={seedHorizon}>Recharger horizon</button>
           </div>
         </div>
 
-        <div className="card">
-          <div className="row"><strong>Catalogue actuel</strong><span className="badge">{rooms.length}</span></div>
+        <div className="card card-scroll">
+          <div className="row"><div className="card-title">Catalogue des categories</div><span className="badge">{rooms.length}</span></div>
           <div className="list">
             {rooms.map((r) => (
-              <div className="item" key={r.room_type} style={{ cursor: "pointer" }} onClick={() => setForm(r)}>
-                <div className="row">
-                  <strong>{r.room_type}</strong>
-                  <span className="badge">{r.is_active ? "actif" : "off"}</span>
+              <div key={r.room_type} className="item inventory-catalog-item">
+                <div className="row" style={{ alignItems: "flex-start" }}>
+                  <div style={{ flex: 1, cursor: "pointer" }} onClick={() => setForm(r)}>
+                    <strong>{r.room_type}</strong>
+                    <span className="badge" style={{ marginLeft: 8 }}>{r.is_active ? "actif" : "bloque"}</span>
+                    <div className="small" style={{ marginTop: 4 }}>Capacite: {r.capacity} - Prix: {r.price_eur} EUR - Stock/jour: {r.rooms_per_day}</div>
+                  </div>
+                  <div className="inventory-item-actions" onClick={(e) => e.stopPropagation()}>
+                    <button type="button" className="btn-small" onClick={() => toggleBlock(r)} title={r.is_active ? "Bloquer (indisponible)" : "Activer"}>
+                      {r.is_active ? "Bloquer" : "Activer"}
+                    </button>
+                    <button type="button" className="btn-small btn-danger" onClick={() => deleteCategory(r.room_type)} title="Supprimer la categorie">
+                      Supprimer
+                    </button>
+                  </div>
                 </div>
-                <div className="small">Cap: {r.capacity} - Prix: {r.price_eur} EUR - Stock/jour: {r.rooms_per_day}</div>
               </div>
             ))}
-            {rooms.length === 0 ? <div className="small">Aucun type configure.</div> : null}
+            {rooms.length === 0 ? <div className="small">Aucune categorie configuree.</div> : null}
           </div>
         </div>
       </div>
 
       <div className="card">
         <div className="row" style={{ marginBottom: 10 }}>
-          <strong>Disponibilite mensuelle</strong>
+          <div className="card-title">Disponibilite actuelle par categorie</div>
           <div style={{ display: "flex", gap: 8 }}>
             <input type="number" value={year} onChange={(e) => setYear(Number(e.target.value))} style={{ width: 90 }} />
             <input type="number" min={1} max={12} value={month} onChange={(e) => setMonth(Number(e.target.value))} style={{ width: 70 }} />
           </div>
         </div>
 
-        <div style={{ overflow: "auto" }}>
-          <table className="table">
-            <thead>
-              <tr>
-                <th>Date</th>
-                {roomTypes.map((rt) => <th key={rt}>{rt}</th>)}
-              </tr>
-            </thead>
-            <tbody>
-              {monthRows.map((row) => (
-                <tr key={row.date}>
-                  <td className="mono">{row.date}</td>
-                  {roomTypes.map((rt) => <td key={`${row.date}-${rt}`}>{row.availability?.[rt] ?? 0}</td>)}
-                </tr>
-              ))}
-            </tbody>
-          </table>
+        <div className="inventory-kpi-grid">
+          {inventoryCards.map((c) => (
+            <div key={c.roomType} className="inventory-kpi-card">
+              <div className="inventory-kpi-title">{c.roomType}</div>
+              <div className="inventory-kpi-value">{c.availableNow}</div>
+              <div className="small">chambres disponibles (date cible)</div>
+              <div className="small" style={{ marginTop: 6 }}>Moyenne mois: {c.averageMonth} - Min mois: {c.minMonth}</div>
+            </div>
+          ))}
+          {inventoryCards.length === 0 ? <div className="small">Aucune donnee de disponibilite pour la periode selectionnee.</div> : null}
         </div>
       </div>
     </>

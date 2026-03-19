@@ -71,23 +71,30 @@ def init_live_store() -> None:
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 voice_id TEXT NOT NULL,
                 speaking_rate REAL NOT NULL,
+                llm_temperature REAL NOT NULL DEFAULT 0.3,
                 greeting_text TEXT NOT NULL,
                 offer_text TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
             """
         )
+        cols = [row[1] for row in c.execute('PRAGMA table_info(agent_config)').fetchall()]
+        if 'llm_temperature' not in cols:
+            c.execute('ALTER TABLE agent_config ADD COLUMN llm_temperature REAL NOT NULL DEFAULT 0.3')
+            c.execute('UPDATE agent_config SET llm_temperature = COALESCE(llm_temperature, 0.3) WHERE id=1')
+
         c.execute('SELECT COUNT(*) FROM agent_config')
         if (c.fetchone() or [0])[0] == 0:
             now = datetime.datetime.utcnow().isoformat()
             c.execute(
                 """
-                INSERT INTO agent_config(id, voice_id, speaking_rate, greeting_text, offer_text, updated_at)
-                VALUES (1, ?, ?, ?, ?, ?)
+                INSERT INTO agent_config(id, voice_id, speaking_rate, llm_temperature, greeting_text, offer_text, updated_at)
+                VALUES (1, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     'Mathieu',
                     1.2,
+                    0.3,
                     "Bonjour et bienvenue chez GuestFlow Hotel, comment puis-je vous aider aujourd'hui ?",
                     "Offre speciale: petit-dejeuner inclus selon disponibilite.",
                     now,
@@ -231,12 +238,13 @@ def get_recent_reservations(limit: int = 100) -> list[dict]:
 def get_agent_config() -> dict:
     with _conn() as conn:
         row = conn.execute(
-            'SELECT voice_id, speaking_rate, greeting_text, offer_text, updated_at FROM agent_config WHERE id=1'
+            'SELECT voice_id, speaking_rate, llm_temperature, greeting_text, offer_text, updated_at FROM agent_config WHERE id=1'
         ).fetchone()
     if not row:
         return {
             'voice_id': 'Mathieu',
             'speaking_rate': 1.2,
+            'llm_temperature': 0.3,
             'greeting_text': "Bonjour et bienvenue chez GuestFlow Hotel, comment puis-je vous aider aujourd'hui ?",
             'offer_text': 'Offre speciale: petit-dejeuner inclus selon disponibilite.',
             'updated_at': None,
@@ -244,9 +252,10 @@ def get_agent_config() -> dict:
     return {
         'voice_id': row[0],
         'speaking_rate': row[1],
-        'greeting_text': row[2],
-        'offer_text': row[3],
-        'updated_at': row[4],
+        'llm_temperature': row[2],
+        'greeting_text': row[3],
+        'offer_text': row[4],
+        'updated_at': row[5],
     }
 
 
@@ -256,12 +265,13 @@ def update_agent_config(payload: dict) -> dict:
         conn.execute(
             """
             UPDATE agent_config
-            SET voice_id=?, speaking_rate=?, greeting_text=?, offer_text=?, updated_at=?
+            SET voice_id=?, speaking_rate=?, llm_temperature=?, greeting_text=?, offer_text=?, updated_at=?
             WHERE id=1
             """,
             (
                 payload.get('voice_id', 'Mathieu'),
                 float(payload.get('speaking_rate', 1.2)),
+                float(payload.get('llm_temperature', 0.3)),
                 payload.get('greeting_text', "Bonjour et bienvenue chez GuestFlow Hotel, comment puis-je vous aider aujourd'hui ?"),
                 payload.get('offer_text', 'Offre speciale: petit-dejeuner inclus selon disponibilite.'),
                 now,

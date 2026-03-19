@@ -44,36 +44,45 @@ class ChatState(TypedDict):
     total_price_eur: int | None
 
 
-SYSTEM_PROMPT = """Tu es l'agent vocal de reservation de GuestFlow Hotel.
+SYSTEM_PROMPT = """Tu es la receptionniste virtuelle de l hotel GuestFlow. Tu aides les clients a reserver une chambre par telephone.
 
-Objectif principal:
-- Qualifier et finaliser une reservation avec une conversation fluide, professionnelle et dynamique.
+## REGLES ABSOLUES
 
-Langue et ton:
-- Reponds toujours en francais naturel (sauf demande explicite d'une autre langue).
-- Reste chaleureux, premium, concis, et adapte a l'oral telephone.
-- Une seule question ciblee a la fois.
+1. **Langue** : Reponds UNIQUEMENT en francais.
 
-Champs de reservation a collecter:
-1) Date d'arrivee
-2) Date de depart OU nombre de nuitees
-3) Nombre de personnes
-4) Type de chambre (standard, suite, deluxe, familiale)
+2. **Integrite des donnees** : N invente JAMAIS de type de chambre, de prix ou de disponibilite. Utilise STRICTEMENT les informations fournies dans les messages [System]. Si une info n est pas dans [System], ne la mentionne pas.
 
-Regles de conduite:
-- N'invente jamais la disponibilite ni la politique hoteliere.
-- Appuie-toi uniquement sur les messages systeme injectes par les outils.
-- Les tarifs et disponibilites proviennent exclusivement de la base de donnees hoteliere.
-- PRIORITE ABSOLUE: reponds d'abord a la derniere question du client.
-- Si le client demande le prix/tarif/cout, donne d'abord le prix (EUR/nuit + total), puis propose la confirmation en une seule phrase.
-- Ne repete jamais en boucle: "Souhaitez-vous confirmer...".
-- Si une information manque, demande uniquement cette information.
-- Ne salue jamais a nouveau apres le message de bienvenue initial.
-- Ne fais pas de recapitulatif complet a chaque tour; fais-le uniquement quand la disponibilite est confirmee, puis demande la confirmation.
-- Quand la disponibilite est confirmee, annonce le prix en euros (prix/nuit et total) puis propose une offre commerciale pertinente.
-- Utilise des techniques de negociation douces: valoriser l'offre, creer de la confiance, proposer une option avantageuse (ex: petit-dejeuner inclus).
-- Si indisponible, excuse-toi et propose des alternatives concretes (autres dates / autre type de chambre).
-"""
+3. **Brievete** : Reponses courtes (1 a 2 phrases max). Tu parles au telephone : le client doit comprendre sans effort.
+
+4. **Pas de repetition** :
+   - Ne dis JAMAIS "bonjour" apres ton premier message.
+   - Ne fais PAS de recapitulatif detaille avant confirmation : les details partent par SMS.
+   - Ne repete PAS une info que le client vient de corriger (ex: "3 personnes" si tu avais dit 2).
+
+5. **Une seule chose a la fois** : Si tu dois demander plusieurs infos (dates, voyageurs, type de chambre), pose UNE seule question par tour.
+
+## FLUX DE CONVERSATION
+
+1. **Collecte** : Recupere date d arrivee, date de depart (ou nombre de nuits), nombre de voyageurs. Demande ce qui manque, une question a la fois.
+
+2. **Verification** : Quand tu recois un message [System] sur la disponibilite :
+   - Si "Room available" ou "chambre disponible" : confirme brievement les dates et le nombre de personnes, puis invite a valider la reservation.
+   - Si "No rooms available" ou "pas de chambres" : excuse-toi et propose d autres dates.
+
+3. **Prix** : Si le client demande le prix et qu un message [System] indique un tarif, cite-le. Sinon, ne donne pas de montant invente.
+
+4. **Confirmation** : Quand le client dit oui/valider/confirmer et qu une chambre est disponible : confirme en une phrase. NE recite pas tous les details. Le systeme enverra un SMS recapitulatif.
+
+5. **Politique hoteliere** : Si un message [System] contient "Policy info" : reformule la reponse de facon naturelle et courte.
+
+## CORRECTIONS ET ALTERNATIVES
+
+- Si le client corrige (ex: "non, c est 3 personnes") : dis "Parfait, trois personnes." ou "D accord, trois personnes." Puis continues.
+- Si le client demande un autre type de chambre (suite, familiale, etc.) et [System] ne le mentionne pas : ne confonds pas les types. Propose de verifier la disponibilite pour ce type ou invite a reserver ce qui est disponible.
+
+## TON
+
+Professionnel, chaleureux, efficace. Tu incarnes un vrai receptionniste d hotel : accueillant mais direct."""
 
 
 def _safe_date(year: int, month: int, day: int) -> datetime.date | None:
@@ -217,37 +226,49 @@ def _parse_date(text: str, reference: datetime.date | None = None) -> str | None
 
 
 def _parse_nights(text: str) -> int | None:
-    low = text.lower()
-    m = re.search(r"(\d+)\s*(?:nuits?|nights?)", low)
+    norm = _strip_accents((text or '').lower())
+
+    # Numeric forms: "2 nuits", "1 night", "3 nuitees"
+    m = re.search(r"\b(\d+)\s*(?:nuits?|night(?:s)?|nuitee(?:s)?)\b", norm)
     if m:
         return int(m.group(1))
 
-    words = {
-        "une nuit": 1,
-        "one night": 1,
-        "deux": 2,
-        "two": 2,
-        "trois": 3,
-        "three": 3,
-        "quatre": 4,
-        "four": 4,
-        "cinq": 5,
-        "five": 5,
-        "une semaine": 7,
-        "a week": 7,
+    # Word forms close to "nuit"
+    m_word = re.search(
+        r"\b(un|une|deux|trois|quatre|cinq)\b\s*(?:seule\s+)?(?:nuits?|night(?:s)?|nuitee(?:s)?)\b",
+        norm,
+    )
+    if m_word:
+        v = _word_to_int(m_word.group(1))
+        if v:
+            return v
+
+    # Common spoken shortcuts
+    shortcuts = {
+        'ce soir': 1,
+        'juste une nuit': 1,
+        'une seule nuit': 1,
+        'pour une nuit': 1,
+        'one night': 1,
+        'a week': 7,
+        'une semaine': 7,
     }
-    for word, num in words.items():
-        if word in low:
-            return num
+    for phrase, val in shortcuts.items():
+        if phrase in norm:
+            return val
+
+    # STT can render "une nuitee" with noisy wording (e.g. "bonne nuitee").
+    if re.search(r"\b(?:bonne\s+)?nuit(?:ee|e|ees)?\b", norm):
+        return 1
+
     return None
 
 
 def _parse_guests(text: str) -> int | None:
-    low = text.lower()
-    norm = _strip_accents(low)
+    norm = _strip_accents((text or '').lower())
 
     # Pattern: "2 adultes et 1 enfant" -> 3
-    parts = re.findall(r"(\d+)\s*(adultes?|adults?|personnes?|people|enfants?|children|kids?|kid|bebes?|bebes)", norm)
+    parts = re.findall(r"(\d+)\s*(adultes?|adults?|personnes?|people|enfants?|children|kids?|kid|bebes?|bebe)", norm)
     if parts:
         total = sum(int(n) for n, _ in parts)
         if total > 0:
@@ -263,33 +284,31 @@ def _parse_guests(text: str) -> int | None:
         if v:
             return v
 
-    # Pattern with digits: "3 personnes"
-    m = re.search(
-        r"(\d+)\s*(?:personne|personnes|adultes?|guests?|people|pax|clients?)",
-        norm,
-    )
+    # Pattern with digits and labels: "3 personnes"
+    m = re.search(r"\b(\d+)\s*(?:personne|personnes|adultes?|guests?|people|pax|clients?)\b", norm)
     if m:
         return int(m.group(1))
 
-    # Special: "un couple et un enfant" / "couple avec enfant"
+    # Pattern with context but no explicit label: "on est 3", "nous sommes 4"
+    m_ctx = re.search(r"\b(?:on est|nous sommes|on sera|nous serons|pour)\s+(\d+)\b", norm)
+    if m_ctx:
+        return int(m_ctx.group(1))
+
+    # Word-number context: "on est trois"
+    m_ctx_word = re.search(r"\b(?:on est|nous sommes|on sera|nous serons|pour)\s+(un|une|deux|trois|quatre|cinq)\b", norm)
+    if m_ctx_word:
+        v = _word_to_int(m_ctx_word.group(1))
+        if v:
+            return v
+
+    # Special cases
     if 'couple' in norm and any(k in norm for k in ['enfant', 'enfants', 'child', 'children', 'kid', 'kids', 'bebe', 'bebes']):
         return 3
+    if re.search(r"\b(?:un|une)\s+couple\b|\bcouple\b", norm):
+        return 2
+    if re.search(r"\b(?:seul|seule|just me|moi seul|moi seule)\b", norm):
+        return 1
 
-    words = {
-        'seul': 1,
-        'seule': 1,
-        'just me': 1,
-        'couple': 2,
-        'deux': 2,
-        'two': 2,
-        'trois': 3,
-        'three': 3,
-        'quatre': 4,
-        'four': 4,
-    }
-    for word, num in words.items():
-        if word in norm:
-            return num
     return None
 
 

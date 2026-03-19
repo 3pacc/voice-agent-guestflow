@@ -4,6 +4,14 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+# Force-load .env so restarted services always use latest keys.
+if [ -f "$ROOT_DIR/.env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . "$ROOT_DIR/.env"
+  set +a
+fi
+
 VENV_PY="${VENV_PY:-$ROOT_DIR/.venv/bin/python}"
 VENV_UVICORN="${VENV_UVICORN:-$ROOT_DIR/.venv/bin/uvicorn}"
 API_PORT="${API_PORT:-8000}"

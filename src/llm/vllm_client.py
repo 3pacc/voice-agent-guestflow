@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from typing import AsyncGenerator
 
@@ -10,9 +11,23 @@ logger = logging.getLogger(__name__)
 
 class VllmClient:
     """
-    Primary: self-hosted vLLM via OpenAI-compatible API.
-    Fallback: Mistral chat API when vLLM is unavailable.
+    Primary: self-hosted vLLM or any OpenAI-compatible endpoint.
+    Fallback: Mistral chat API when primary fails.
+    Includes retry for transient 5xx/overflow/rate-limit errors.
     """
+
+    RETRYABLE_HINTS = (
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+        "overflow",
+        "upstream connect error",
+        "rate limit",
+        "service unavailable",
+        "timed out",
+    )
 
     def __init__(self):
         self.model = settings.llm_model
@@ -37,13 +52,18 @@ class VllmClient:
                 api_key=settings.mistral_api_key,
             )
 
-    async def _stream_from_client(
+    @staticmethod
+    def _is_retryable_exception(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return any(h in msg for h in VllmClient.RETRYABLE_HINTS)
+
+    async def _stream_once(
         self,
         client: AsyncOpenAI,
         model: str,
         messages: list[dict],
-        temperature: float = 0.3,
-        max_tokens: int = 256,
+        temperature: float,
+        max_tokens: int,
     ) -> AsyncGenerator[str, None]:
         response = await client.chat.completions.create(
             model=model,
@@ -62,7 +82,40 @@ class VllmClient:
             if content:
                 yield content
 
-
+    async def _stream_with_retry(
+        self,
+        label: str,
+        client: AsyncOpenAI,
+        model: str,
+        messages: list[dict],
+        temperature: float,
+        max_tokens: int,
+        max_attempts: int = 3,
+    ) -> AsyncGenerator[str, None]:
+        for attempt in range(1, max_attempts + 1):
+            try:
+                yielded_any = False
+                async for token in self._stream_once(
+                    client,
+                    model,
+                    messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                ):
+                    yielded_any = True
+                    yield token
+                if not yielded_any:
+                    logger.warning("%s returned empty stream (attempt %s/%s)", label, attempt, max_attempts)
+                return
+            except Exception as exc:
+                retryable = self._is_retryable_exception(exc)
+                logger.error("%s error (attempt %s/%s): %s", label, attempt, max_attempts, exc, exc_info=True)
+                if retryable and attempt < max_attempts:
+                    delay = 0.5 * (2 ** (attempt - 1))
+                    logger.warning("%s retrying in %.2fs", label, delay)
+                    await asyncio.sleep(delay)
+                    continue
+                raise
 
     @staticmethod
     def _prepare_messages_for_mistral(messages: list[dict]) -> list[dict]:
@@ -81,24 +134,27 @@ class VllmClient:
             )
         return prepared
 
-    async def generate_response_stream(self, messages: list[dict]) -> AsyncGenerator[str, None]:
+    async def generate_response_stream(self, messages: list[dict], temperature: float | None = None) -> AsyncGenerator[str, None]:
         """
         Streams the response token-by-token.
-        Falls back to Mistral if vLLM fails.
+        Falls back to Mistral if primary fails.
         """
+        effective_temp = 0.3 if temperature is None else max(0.0, min(1.5, float(temperature)))
+
         if self.primary_enabled:
             try:
-                async for token in self._stream_from_client(
-                self.client,
-                self.model,
-                messages,
-                temperature=0.3,
-                max_tokens=256,
+                async for token in self._stream_with_retry(
+                    "Primary LLM",
+                    self.client,
+                    self.model,
+                    messages,
+                    temperature=effective_temp,
+                    max_tokens=256,
                 ):
                     yield token
                 return
-            except Exception as exc:
-                logger.error(f"vLLM API error: {exc}", exc_info=True)
+            except Exception:
+                logger.error("Primary LLM failed after retries", exc_info=True)
 
         if self.fallback_client is not None:
             try:
@@ -108,16 +164,17 @@ class VllmClient:
                     self.fallback_model,
                 )
                 fallback_messages = self._prepare_messages_for_mistral(messages)
-                async for token in self._stream_from_client(
+                async for token in self._stream_with_retry(
+                    "Fallback LLM",
                     self.fallback_client,
                     self.fallback_model,
                     fallback_messages,
-                    temperature=0.4,
+                    temperature=min(1.5, effective_temp + 0.1),
                     max_tokens=256,
                 ):
                     yield token
                 return
-            except Exception as exc:
-                logger.error(f"Fallback LLM error: {exc}", exc_info=True)
+            except Exception:
+                logger.error("Fallback LLM failed after retries", exc_info=True)
 
-        yield "Sorry, I am having trouble connecting to my brain right now."
+        yield "Je rencontre un ralentissement temporaire. Pouvez-vous repeter votre demande en une phrase courte ?"

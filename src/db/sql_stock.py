@@ -7,7 +7,7 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from sqlalchemy import Boolean, Column, Date, DateTime, Integer, String, create_engine
+from sqlalchemy import Boolean, Column, Date, DateTime, Integer, String, UniqueConstraint, create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from src.config.settings import settings
@@ -34,6 +34,21 @@ class RoomStock(Base):
     room_type = Column(String(50), nullable=False)
     date = Column(Date, nullable=False)
     available = Column(Boolean, default=True)
+
+
+class StockAllocation(Base):
+    __tablename__ = 'stock_allocations'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    reservation_ref = Column(String(80), nullable=False)
+    room_type = Column(String(50), nullable=False)
+    date = Column(Date, nullable=False)
+    stock_id = Column(Integer, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint('reservation_ref', 'room_type', 'date', name='uq_stock_allocation_res_room_day'),
+    )
 
 
 _SQLITE_ARGS = {'check_same_thread': False} if settings.database_url.startswith('sqlite') else {}
@@ -98,6 +113,29 @@ def _catalog_map(db, include_inactive: bool = False) -> dict[str, dict]:
         }
         for r in rows
     }
+
+
+def delete_room_config(room_type: str) -> dict:
+    rt = _normalize_room_type(room_type)
+    with SessionLocal() as db:
+        row = db.query(RoomCatalog).filter(RoomCatalog.room_type == rt).first()
+        if not row:
+            return {"ok": False, "reason": "categorie_introuvable", "room_type": rt}
+        db.delete(row)
+        db.commit()
+    return {"ok": True, "room_type": rt}
+
+
+def toggle_room_active(room_type: str, is_active: bool) -> dict:
+    rt = _normalize_room_type(room_type)
+    with SessionLocal() as db:
+        row = db.query(RoomCatalog).filter(RoomCatalog.room_type == rt).first()
+        if not row:
+            return {"ok": False, "reason": "categorie_introuvable", "room_type": rt}
+        row.is_active = bool(is_active)
+        row.updated_at = datetime.datetime.utcnow()
+        db.commit()
+    return {"ok": True, "room_type": rt, "is_active": is_active}
 
 
 def get_room_catalog(active_only: bool = False) -> list[dict]:
@@ -175,16 +213,16 @@ def _ensure_seed_data(db, horizon_days: int = DEFAULT_HORIZON_DAYS) -> int:
         day = today + datetime.timedelta(days=offset)
         for room_type, conf in catalog.items():
             target = max(0, int(conf['rooms_per_day']))
-            available_count = (
+            # Keep a fixed pool size and do not recreate rooms already booked (available=False).
+            total_count = (
                 db.query(RoomStock)
                 .filter(
                     RoomStock.room_type == room_type,
                     RoomStock.date == day,
-                    RoomStock.available == True,
                 )
                 .count()
             )
-            missing = max(0, target - available_count)
+            missing = max(0, target - total_count)
             for _ in range(missing):
                 db.add(RoomStock(room_type=room_type, date=day, available=True))
                 inserted += 1
@@ -321,6 +359,110 @@ def check_availability_details(
             'alternatives': [v for _, v in sorted(catalog.items()) if v['room_type'] != normalized],
             'reason': 'ok',
         }
+
+
+def _coerce_date(value: str | datetime.date | None) -> datetime.date | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime.date):
+        return value
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        return datetime.date.fromisoformat(raw[:10])
+    except Exception:
+        return None
+
+
+def allocate_stock_for_reservation(
+    room_type: str | None,
+    check_in_date: str | datetime.date | None,
+    check_out_date: str | datetime.date | None,
+    reservation_ref: str | None,
+) -> dict:
+    """Atomically mark one room/day unavailable for a confirmed reservation."""
+    normalized = _normalize_room_type(room_type)
+    check_in = _coerce_date(check_in_date)
+    check_out = _coerce_date(check_out_date)
+    ref = (reservation_ref or '').strip()
+
+    if not ref:
+        return {'allocated': False, 'reason': 'missing_reservation_ref'}
+    if not check_in or not check_out or check_out <= check_in:
+        return {'allocated': False, 'reason': 'invalid_dates'}
+
+    nights = (check_out - check_in).days
+
+    with SessionLocal() as db:
+        existing = (
+            db.query(StockAllocation)
+            .filter(
+                StockAllocation.reservation_ref == ref,
+                StockAllocation.room_type == normalized,
+                StockAllocation.date >= check_in,
+                StockAllocation.date < check_out,
+            )
+            .count()
+        )
+        if existing >= nights:
+            return {'allocated': True, 'already_allocated': True, 'allocated_nights': nights}
+
+        current = check_in
+        allocated = 0
+        try:
+            while current < check_out:
+                already = (
+                    db.query(StockAllocation)
+                    .filter(
+                        StockAllocation.reservation_ref == ref,
+                        StockAllocation.room_type == normalized,
+                        StockAllocation.date == current,
+                    )
+                    .first()
+                )
+                if already:
+                    allocated += 1
+                    current += datetime.timedelta(days=1)
+                    continue
+
+                stock_row = (
+                    db.query(RoomStock)
+                    .filter(
+                        RoomStock.room_type == normalized,
+                        RoomStock.date == current,
+                        RoomStock.available == True,
+                    )
+                    .order_by(RoomStock.id.asc())
+                    .first()
+                )
+                if not stock_row:
+                    db.rollback()
+                    return {
+                        'allocated': False,
+                        'reason': 'no_stock_on_day',
+                        'failed_day': current.isoformat(),
+                        'allocated_nights': allocated,
+                    }
+
+                stock_row.available = False
+                db.add(
+                    StockAllocation(
+                        reservation_ref=ref,
+                        room_type=normalized,
+                        date=current,
+                        stock_id=stock_row.id,
+                        created_at=datetime.datetime.utcnow(),
+                    )
+                )
+                allocated += 1
+                current += datetime.timedelta(days=1)
+
+            db.commit()
+            return {'allocated': True, 'already_allocated': False, 'allocated_nights': allocated}
+        except Exception as exc:
+            db.rollback()
+            return {'allocated': False, 'reason': 'allocation_error', 'error': str(exc)}
 
 
 def check_availability(check_in: datetime.date, check_out: datetime.date, room_type: str = 'standard') -> bool:

@@ -1,5 +1,6 @@
 import './globals.css';
 import Link from 'next/link';
+import ThemeToggle from './components/theme-toggle';
 
 function Icon({ path }: { path: string }) {
   return (
@@ -22,7 +23,7 @@ const nav = [
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="fr">
+    <html lang="fr" data-theme="dark">
       <body>
         <div className="app-shell">
           <aside className="sidebar">
@@ -41,6 +42,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
                 </Link>
               ))}
             </nav>
+            <div style={{ marginTop: 14 }}>
+              <ThemeToggle />
+            </div>
           </aside>
           <main className="main">{children}</main>
         </div>

@@ -17,8 +17,8 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from src.agent.booking_graph import SYSTEM_PROMPT, booking_agent
 from src.config.settings import settings
-from src.db.live_store import append_call_event, append_reservation, append_transcript
-from src.db.sql_stock import ensure_horizon
+from src.db.live_store import append_call_event, append_reservation, append_transcript, get_agent_config
+from src.db.sql_stock import allocate_stock_for_reservation, ensure_horizon
 from src.llm.vllm_client import VllmClient
 from src.stt.mistral_stt import MistralRealtimeSTT
 from src.tts.inworld_tts import InworldTTS
@@ -154,6 +154,52 @@ def _build_pricing_context_reply(state: dict) -> str:
     return (
         "Je vais verifier le tarif exact dans la base de donnees avant confirmation. "
         "Pouvez-vous me confirmer le type de chambre et les dates ?"
+    )
+
+
+def _missing_booking_fields(state: dict) -> list[str]:
+    missing: list[str] = []
+    if not state.get('check_in_date'):
+        missing.append('check_in_date')
+    if not state.get('check_out_date') and not state.get('nights'):
+        missing.append('stay_length')
+    if not state.get('guests'):
+        missing.append('guests')
+    if not state.get('room_type'):
+        missing.append('room_type')
+    return missing
+
+
+def _build_next_slot_question(state: dict) -> str | None:
+    missing = _missing_booking_fields(state)
+    if not missing:
+        return None
+
+    first = missing[0]
+    prompts = {
+        'check_in_date': "Pouvez-vous me donner la date d'arrivee precise, s'il vous plait ?",
+        'stay_length': "Souhaitez-vous indiquer la date de depart ou le nombre de nuits ?",
+        'guests': "Pour combien de personnes souhaitez-vous reserver ?",
+        'room_type': "Quel type de chambre preferez-vous: standard, deluxe, familiale ou suite ?",
+    }
+    return prompts.get(first)
+
+
+def _build_state_guardrail_message(state: dict) -> str:
+    missing = _missing_booking_fields(state)
+    missing_txt = ', '.join(missing) if missing else 'none'
+    return (
+        "[Etat reservation] "
+        f"stage={state.get('stage')}; "
+        f"check_in_date={state.get('check_in_date')}; "
+        f"check_out_date={state.get('check_out_date')}; "
+        f"nights={state.get('nights')}; "
+        f"guests={state.get('guests')}; "
+        f"room_type={state.get('room_type')}; "
+        f"room_available={state.get('room_available')}; "
+        f"missing_fields={missing_txt}. "
+        "Instruction stricte: ne redemande jamais un champ deja renseigne. "
+        "Pose une seule question, sur le premier champ manquant."
     )
 
 
@@ -304,6 +350,7 @@ async def twilio_media_stream(websocket: WebSocket):
         'reservation_confirmed': False,
         'reservation_ref': None,
         'sms_sent': False,
+        'llm_temperature': 0.3,
     }
 
     caller_number: str | None = None
@@ -370,57 +417,97 @@ async def twilio_media_stream(websocket: WebSocket):
                 payment_link = _payment_link_for_ref(reservation_ref)
                 target_number = caller_number or (settings.booking_sms_fallback_to or '').strip()
 
-                sms_result = {'ok': False, 'sid': None, 'status': None, 'error': 'not_attempted'}
-                if settings.booking_sms_enabled and target_number:
-                    sms_body = _build_sms_body(conv_state, reservation_ref, payment_link)
-                    sms_result = await _send_booking_sms(target_number, sms_body)
-                elif settings.booking_sms_enabled:
-                    logger.warning('SMS enabled but no caller/fallback number available for booking confirmation.')
-                    sms_result = {'ok': False, 'sid': None, 'status': None, 'error': 'missing_caller_and_fallback'}
-
-                sms_sent = bool(sms_result.get('ok'))
-                conv_state['reservation_confirmed'] = True
-                conv_state['reservation_ref'] = reservation_ref
-                conv_state['sms_sent'] = sms_sent
-                conv_state['stage'] = 'done'
-                should_hangup_after_response = True
-
-                _trace(
-                    'booking_finalized',
-                    reservation_ref=reservation_ref,
-                    stream_sid=stream_sid,
-                    caller_number=caller_number,
-                    target_number=target_number,
-                    sms_enabled=settings.booking_sms_enabled,
-                    sms_sent=sms_sent,
-                    sms_sid=sms_result.get('sid'),
-                    sms_status=sms_result.get('status'),
-                    sms_error=sms_result.get('error'),
+                allocation = allocate_stock_for_reservation(
+                    room_type=conv_state.get('room_type'),
                     check_in_date=conv_state.get('check_in_date'),
                     check_out_date=conv_state.get('check_out_date'),
-                    nights=conv_state.get('nights'),
-                    guests=conv_state.get('guests'),
-                    room_type=conv_state.get('room_type'),
+                    reservation_ref=reservation_ref,
                 )
-                append_call_event(call_sid, 'booking_finalized', {'reservation_ref': reservation_ref, 'sms_sent': sms_sent, 'sms_status': sms_result.get('status'), 'sms_error': sms_result.get('error'), 'check_in_date': conv_state.get('check_in_date'), 'check_out_date': conv_state.get('check_out_date'), 'nights': conv_state.get('nights'), 'guests': conv_state.get('guests'), 'room_type': conv_state.get('room_type')})
-                append_reservation({'call_sid': call_sid, 'reservation_ref': reservation_ref, 'sms_sent': sms_sent, 'sms_status': sms_result.get('status'), 'sms_error': sms_result.get('error'), 'check_in_date': conv_state.get('check_in_date'), 'check_out_date': conv_state.get('check_out_date'), 'nights': conv_state.get('nights'), 'guests': conv_state.get('guests'), 'room_type': conv_state.get('room_type')})
 
-                if sms_sent:
-                    tool_msg = AIMessage(
-                        content=(
-                            f'[System] Reservation finalisee. Reference: {reservation_ref}. '
-                            f'Un SMS recapitulatif avec lien de paiement test a ete envoye au {target_number}. '
-                            'Confirme brievement la reservation au client et invite-le a finaliser le paiement via le lien SMS.'
-                        )
+                if not allocation.get('allocated'):
+                    _trace(
+                        'booking_finalization_failed_no_stock',
+                        reservation_ref=reservation_ref,
+                        room_type=conv_state.get('room_type'),
+                        check_in_date=conv_state.get('check_in_date'),
+                        check_out_date=conv_state.get('check_out_date'),
+                        reason=allocation.get('reason'),
+                        failed_day=allocation.get('failed_day'),
+                    )
+                    append_call_event(
+                        call_sid,
+                        'booking_finalization_failed',
+                        {
+                            'reservation_ref': reservation_ref,
+                            'reason': allocation.get('reason'),
+                            'failed_day': allocation.get('failed_day'),
+                            'room_type': conv_state.get('room_type'),
+                            'check_in_date': conv_state.get('check_in_date'),
+                            'check_out_date': conv_state.get('check_out_date'),
+                        },
+                    )
+                    conv_state['room_available'] = False
+                    conv_state['reservation_confirmed'] = False
+                    conv_state['stage'] = 'collect'
+                    failed_day = allocation.get('failed_day') or 'la periode demandee'
+                    final_response_override = (
+                        f"Desole, la disponibilite vient de changer pour le {failed_day}. "
+                        'Souhaitez-vous que je vous propose une autre chambre ou d autres dates ?'
                     )
                 else:
-                    tool_msg = AIMessage(
-                        content=(
-                            f'[System] Reservation finalisee. Reference: {reservation_ref}. '
-                            f'Lien de paiement test: {payment_link}. '
-                            "Le SMS n'a pas pu etre envoye automatiquement. Donne la reference au client et indique qu'un lien sera envoye."
-                        )
+                    sms_result = {'ok': False, 'sid': None, 'status': None, 'error': 'not_attempted'}
+                    if settings.booking_sms_enabled and target_number:
+                        sms_body = _build_sms_body(conv_state, reservation_ref, payment_link)
+                        sms_result = await _send_booking_sms(target_number, sms_body)
+                    elif settings.booking_sms_enabled:
+                        logger.warning('SMS enabled but no caller/fallback number available for booking confirmation.')
+                        sms_result = {'ok': False, 'sid': None, 'status': None, 'error': 'missing_caller_and_fallback'}
+
+                    sms_sent = bool(sms_result.get('ok'))
+                    conv_state['reservation_confirmed'] = True
+                    conv_state['reservation_ref'] = reservation_ref
+                    conv_state['sms_sent'] = sms_sent
+                    conv_state['stage'] = 'done'
+                    should_hangup_after_response = True
+
+                    _trace(
+                        'booking_finalized',
+                        reservation_ref=reservation_ref,
+                        stream_sid=stream_sid,
+                        caller_number=caller_number,
+                        target_number=target_number,
+                        sms_enabled=settings.booking_sms_enabled,
+                        sms_sent=sms_sent,
+                        sms_sid=sms_result.get('sid'),
+                        sms_status=sms_result.get('status'),
+                        sms_error=sms_result.get('error'),
+                        stock_allocated=True,
+                        allocated_nights=allocation.get('allocated_nights'),
+                        check_in_date=conv_state.get('check_in_date'),
+                        check_out_date=conv_state.get('check_out_date'),
+                        nights=conv_state.get('nights'),
+                        guests=conv_state.get('guests'),
+                        room_type=conv_state.get('room_type'),
                     )
+                    append_call_event(call_sid, 'booking_finalized', {'reservation_ref': reservation_ref, 'sms_sent': sms_sent, 'sms_status': sms_result.get('status'), 'sms_error': sms_result.get('error'), 'stock_allocated': True, 'allocated_nights': allocation.get('allocated_nights'), 'check_in_date': conv_state.get('check_in_date'), 'check_out_date': conv_state.get('check_out_date'), 'nights': conv_state.get('nights'), 'guests': conv_state.get('guests'), 'room_type': conv_state.get('room_type')})
+                    append_reservation({'call_sid': call_sid, 'reservation_ref': reservation_ref, 'sms_sent': sms_sent, 'sms_status': sms_result.get('status'), 'sms_error': sms_result.get('error'), 'check_in_date': conv_state.get('check_in_date'), 'check_out_date': conv_state.get('check_out_date'), 'nights': conv_state.get('nights'), 'guests': conv_state.get('guests'), 'room_type': conv_state.get('room_type')})
+
+                    if sms_sent:
+                        tool_msg = AIMessage(
+                            content=(
+                                f'[System] Reservation finalisee. Reference: {reservation_ref}. '
+                                f'Un SMS recapitulatif avec lien de paiement test a ete envoye au {target_number}. '
+                                'Confirme brievement la reservation au client et invite-le a finaliser le paiement via le lien SMS.'
+                            )
+                        )
+                    else:
+                        tool_msg = AIMessage(
+                            content=(
+                                f'[System] Reservation finalisee. Reference: {reservation_ref}. '
+                                f'Lien de paiement test: {payment_link}. '
+                                "Le SMS n'a pas pu etre envoye automatiquement. Donne la reference au client et indique qu'un lien sera envoye."
+                            )
+                        )
 
                 conv_state['messages'].append(tool_msg)
                 final_response_override = _build_final_confirmation_text(
@@ -436,9 +523,18 @@ async def twilio_media_stream(websocket: WebSocket):
                     final_response_override = _build_pricing_context_reply(conv_state)
                 else:
                     final_response_override = _build_confirmation_question(conv_state)
+            elif (
+                conv_state.get('stage') == 'details_collection'
+                and conv_state.get('room_available') is None
+            ):
+                # Deterministic slot question avoids re-asking already captured fields.
+                final_response_override = _build_next_slot_question(conv_state)
 
             messages_for_llm = (
-                [{'role': 'system', 'content': SYSTEM_PROMPT}]
+                [
+                    {'role': 'system', 'content': SYSTEM_PROMPT},
+                    {'role': 'system', 'content': _build_state_guardrail_message(conv_state)},
+                ]
                 + [
                     {
                         'role': 'user' if isinstance(m, HumanMessage) else 'assistant',
@@ -452,7 +548,7 @@ async def twilio_media_stream(websocket: WebSocket):
                 response_text = final_response_override
             else:
                 generated_parts = []
-                async for token in llm.generate_response_stream(messages_for_llm):
+                async for token in llm.generate_response_stream(messages_for_llm, temperature=conv_state.get('llm_temperature', 0.3)):
                     generated_parts.append(token)
                 response_text = ''.join(generated_parts).strip()
 
@@ -515,6 +611,8 @@ async def twilio_media_stream(websocket: WebSocket):
                     caller_number = fallback or None
 
                 ensure_horizon(days=90)
+                cfg = get_agent_config()
+                conv_state['llm_temperature'] = float(cfg.get('llm_temperature', 0.3) or 0.3)
                 logger.info(f'Stream started - SID: {stream_sid}')
                 if caller_number:
                     logger.info(f'Caller number available for SMS: {caller_number}')
