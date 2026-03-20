@@ -1,4 +1,4 @@
-# Scripts d'exploitation (Runpod SSH)
+# Scripts d'exploitation (Runpod SSH) - CPUs 
 
 Ce guide explique comment lancer et maitriser le projet de A a Z sur Runpod.
 
